@@ -60,6 +60,12 @@ interface State {
 	release: Record<string, unknown>;
 	tags: Set<string>;
 	workflows: Record<string, string>;
+	/** The default branch's workflows; the tag's are used when unset. */
+	defaultWorkflows?: Record<string, string>;
+	/** Makes listing the default branch's workflows fail. */
+	defaultBranchError?: boolean;
+	/** Every workflow file fetched, as "<ref or default>:<name>". */
+	fileReads: string[];
 	patches: unknown[];
 }
 let state: State;
@@ -93,18 +99,27 @@ function fakeGitHub(input: RequestInfo | URL, init?: RequestInit): Response {
 	if (path.startsWith("/commits/")) {
 		return json({ sha: SHA });
 	}
+	// No `ref` means the default branch, as in the real Contents API.
+	const at = url.searchParams.get("ref");
+	const workflows = at === null ? (state.defaultWorkflows ?? state.workflows) : state.workflows;
 	if (path === "/contents/.github/workflows") {
+		if (at === null && state.defaultBranchError) {
+			return json({ message: "Server Error" }, 502);
+		}
 		return json(
-			Object.keys(state.workflows).map((name) => ({
+			Object.entries(workflows).map(([name, text]) => ({
 				type: "file",
 				name,
 				path: `.github/workflows/${name}`,
+				// Stands in for the blob SHA: equal exactly when the contents are.
+				sha: btoa(text),
 			})),
 		);
 	}
 	const file = path.match(/^\/contents\/\.github\/workflows\/(.+)$/);
-	if (file && state.workflows[file[1]] !== undefined) {
-		return json({ type: "file", content: btoa(state.workflows[file[1]]) });
+	if (file && workflows[file[1]] !== undefined) {
+		state.fileReads.push(`${at ?? "default"}:${file[1]}`);
+		return json({ type: "file", content: btoa(workflows[file[1]]) });
 	}
 	return json({ message: `Unexpected ${method} ${path}` }, 500);
 }
@@ -127,6 +142,7 @@ beforeEach(() => {
 		},
 		tags: new Set(),
 		workflows: { "deploy.yml": DEPLOY, "tags.yml": TAG_PUSH },
+		fileReads: [],
 		patches: [],
 	};
 	vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) =>
@@ -229,6 +245,70 @@ describe("publish_release", () => {
 			{ path: ".github/workflows/after.yml", name: "After deploy" },
 		]);
 		expect(preview.workflows.note).toMatch(/default branch/);
+	});
+
+	it("reads workflow_run consumers from the default branch, not the tag", async () => {
+		// The tag predates after.yml; GitHub still runs it, from the default branch.
+		state.defaultWorkflows = {
+			...state.workflows,
+			"after.yml": "name: After deploy\non:\n  workflow_run:\n    workflows: [Deploy]\n",
+		};
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.triggered_by_workflow_run).toEqual([
+			{ path: ".github/workflows/after.yml", name: "After deploy" },
+		]);
+		expect(preview.workflows.note).toMatch(/default branch/);
+
+		// Files unchanged between the tag and the default branch are fetched once.
+		expect(state.fileReads.filter((r) => r.startsWith("default:"))).toEqual([
+			"default:after.yml",
+		]);
+
+		// The consumer is bound into the token: dropping it changes the token.
+		delete state.defaultWorkflows["after.yml"];
+		await expect(
+			publish({ release_id: 1, confirm: true, confirm_token: preview.confirm_token }),
+		).rejects.toThrow(/changed since the preview/);
+	});
+
+	it("ignores workflow_run consumers that exist only at the tag", async () => {
+		state.workflows["after.yml"] =
+			"name: After deploy\non:\n  workflow_run:\n    workflows: [Deploy]\n";
+		state.defaultWorkflows = { "deploy.yml": DEPLOY };
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.triggered_by_workflow_run).toBeUndefined();
+	});
+
+	it("says so, and binds it into the token, when the default branch cannot be read", async () => {
+		state.defaultBranchError = true;
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.default_branch_unreadable).toBe(true);
+		expect(preview.workflows.note).toMatch(/Could not read .*default branch/);
+
+		state.defaultBranchError = false;
+		await expect(
+			publish({ release_id: 1, confirm: true, confirm_token: preview.confirm_token }),
+		).rejects.toThrow(/changed since the preview/);
+	});
+
+	it("lists consumers of an unanalysed workflow as possibly triggered", async () => {
+		state.workflows["release.yml"] = "name: Release\non: [release\n";
+		state.defaultWorkflows = {
+			...state.workflows,
+			"ship.yml": "name: Ship\non:\n  workflow_run:\n    workflows: [Release]\n",
+			"after.yml": "name: After deploy\non:\n  workflow_run:\n    workflows: [Deploy]\n",
+		};
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.unanalysed).toEqual([".github/workflows/release.yml"]);
+		expect(preview.workflows.triggered_by_workflow_run).toEqual([
+			{ path: ".github/workflows/after.yml", name: "After deploy" },
+		]);
+		expect(preview.workflows.possibly_triggered_by_workflow_run).toEqual([
+			{ path: ".github/workflows/ship.yml", name: "Ship" },
+		]);
+		expect(preview.untrusted_fields).toEqual(
+			expect.arrayContaining(["workflows.possibly_triggered_by_workflow_run[].name"]),
+		);
 	});
 
 	it("refuses confirm without a token", async () => {

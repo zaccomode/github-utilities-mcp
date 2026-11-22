@@ -186,4 +186,30 @@ describe("workflow_run", () => {
 			"audit.yml",
 		]);
 	});
+
+	it("matches a non-string scalar name as GitHub writes it", () => {
+		expect(parse("name: 1.0\non: release\n").name).toBe("1.0");
+		expect(parse("name: true\non: release\n").name).toBe("true");
+		expect(parse("name:\non: release\n").name).toBeUndefined();
+
+		const wf = (path: string, yaml: string) => ({ path, workflow: parse(yaml) });
+		const release = wf("release.yml", "name: 1.0\non: release\n");
+		const deploy = wf("deploy.yml", "on:\n  workflow_run:\n    workflows: ['1.0']\n");
+		expect(workflowRunChain([release, deploy], [release]).map((w) => w.path)).toEqual([
+			"deploy.yml",
+		]);
+	});
+
+	it("lists a default-branch copy of a started workflow that waits on another", () => {
+		const wf = (path: string, yaml: string) => ({ path, workflow: parse(yaml) });
+		const started = wf("release.yml", "name: Release\non: release\n");
+		const onDefault = wf(
+			"release.yml",
+			"name: Release\non:\n  release:\n  workflow_run:\n    workflows: [Build]\n",
+		);
+		const build = wf("build.yml", "name: Build\non: release\n");
+		expect(workflowRunChain([onDefault], [started, build]).map((w) => w.path)).toEqual([
+			"release.yml",
+		]);
+	});
 });
