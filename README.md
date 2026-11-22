@@ -104,10 +104,14 @@ delete releases, and manage the files attached to them.
   `unanalysed` as possibly starting, never dropped, and is bound into the
   token. Workflows with `on: workflow_run` that name a listed workflow, directly
   or through a chain of up to three, are listed under
-  `triggered_by_workflow_run`. GitHub reads `workflow_run` workflows from the
-  default branch rather than the tagged commit, so that list is an
-  approximation and the preview says so. Workflow names, paths and the release
-  title come from contributors, so both tools mark them in `untrusted_fields`.
+  `triggered_by_workflow_run`. GitHub runs `workflow_run` workflows from the
+  default branch, not the tagged commit, so they are read there and bound into
+  the token too. When a workflow at the tag can't be analysed, default-branch
+  `workflow_run` workflows waiting for a name nothing else accounts for are
+  listed under `possibly_triggered_by_workflow_run`. If the default branch's
+  workflows can't be read, the preview says so and that is bound into the
+  token as well. Workflow names, paths and the release title come from
+  contributors, so both tools mark them in `untrusted_fields`.
 - **Promoting a prerelease takes two calls too.** Turning a published
   prerelease into a full release sends `release: released`, which starts
   deploys like this repository's own. `update_release` refuses that change;
@@ -281,7 +285,7 @@ CI runs both on every pull request.
 
 ## Design notes
 
-**Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and deliberately holds no credentials at all.
+**Where the credentials live.** The GitHub access and refresh tokens are stored in the OAuth grant's `props`, which `@cloudflare/workers-oauth-provider` encrypts using the issued MCP token as key material. D1 holds tenant records, connection history and usage counters, and holds no credentials it could open by itself: the two places it keeps a sealed token (upload links and refresh handoffs, below) need a secret it doesn't store.
 
 **Upload links** are stored in D1 rather than KV, because only D1's `UPDATE … WHERE used_at IS NULL` can stop a link being used twice. Only the link's SHA-256 is stored. The link's secret is sent in the upload's `Authorization: Bearer` header; the URL carries only its SHA-256, so the request URLs Workers Logs records can't be replayed. A link made with `act_as: "user"` has to carry the person's token until the file arrives, so the token is encrypted with a key derived from both the secret and the Worker's `GITHUB_CLIENT_SECRET`: neither the row nor the URL can be turned back into a credential. The sealed token is cleared the moment the link is claimed, and from any link that expires unused. Each link also records the OAuth grant that made it, and the upload is refused if that grant has been revoked since.
 
@@ -292,6 +296,22 @@ use the replacement once, and throw it away, bricking the grant. Instead the MCP
 access token is given a 1-hour TTL, comfortably shorter than GitHub's 8 hours, so
 the MCP token always expires first and every refresh flows through the one place
 that can persist the result.
+
+**Concurrent refreshes share one GitHub call.** GitHub refresh tokens are
+single-use, and since workers-oauth-provider 1.1 a refresh that answers
+`invalid_grant` revokes the whole grant. When two refreshes of one grant
+arrive together, the first claims a D1 row named after the SHA-256 of the
+refresh token it is about to spend. Any other refresh holding that token waits
+for the new pair instead of calling GitHub. The pair is stored encrypted with a
+key derived from the spent refresh token (only the grant holds it) and
+`GITHUB_CLIENT_SECRET`, and is deleted after ten minutes. A refresh that is
+still waiting after eight seconds gets `temporarily_unavailable`, which leaves
+the grant intact so the client can retry.
+
+**`/healthz` and `/webhooks/github` don't go through the OAuth provider.**
+Building the provider needs a valid `PUBLIC_URL`, so these two routes are
+answered first and keep working if it is misconfigured. Every other route
+answers 500 with a message naming the setting.
 
 **Installation tokens** are cached in KV per installation. The app-JWT endpoints
 share a single 5,000/hour budget across every tenant, so minting per request

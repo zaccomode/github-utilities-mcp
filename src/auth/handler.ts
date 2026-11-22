@@ -4,7 +4,8 @@
  *
  * The OAuth provider hands us any request that isn't an API route. Requests that
  * reach /mcp have already been authenticated by the library and are handled in
- * src/index.ts instead. Upload links are routed from here too, but answer in
+ * src/index.ts instead, as are /healthz and /webhooks/github, which must work
+ * even when the provider cannot be built. Upload links are routed from here too, but answer in
  * JSON rather than HTML; see src/uploads/handler.ts.
  */
 
@@ -32,7 +33,6 @@ import {
 	fetchUser,
 	listUserInstallations,
 } from "./user-oauth";
-import { handleWebhook } from "./webhook";
 
 export const authorizeHandler = {
 	async fetch(request: Request, env: AppEnv): Promise<Response> {
@@ -47,9 +47,6 @@ export const authorizeHandler = {
 				case "/":
 					return html(landingPage(`${publicUrl(env)}/mcp`));
 
-				case "/healthz":
-					return new Response("ok\n", { headers: { "Content-Type": "text/plain" } });
-
 				case "/authorize":
 					return await handleAuthorize(request, env, url);
 
@@ -58,9 +55,6 @@ export const authorizeHandler = {
 
 				case "/select":
 					return await handleSelect(request, env);
-
-				case "/webhooks/github":
-					return await handleWebhook(request, env);
 
 				default:
 					return new Response("Not found\n", { status: 404 });

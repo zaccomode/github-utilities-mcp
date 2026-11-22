@@ -50,9 +50,48 @@ export function required(env: AppEnv, name: keyof AppEnv): string {
 	return value;
 }
 
-/** The externally reachable origin, without a trailing slash. */
+/**
+ * The externally reachable base URL, canonicalised and without a trailing
+ * slash. `new URL()` lowercases the scheme and host and drops a default port,
+ * which the OAuth provider insists on for its resource identifier; anything
+ * that still cannot serve as one is refused here with a message naming the
+ * setting, rather than as an opaque error from inside the provider.
+ */
 export function publicUrl(env: AppEnv): string {
-	return required(env, "PUBLIC_URL").replace(/\/+$/, "");
+	return canonicalPublicUrl(required(env, "PUBLIC_URL"));
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+export function canonicalPublicUrl(value: string): string {
+	const problem = (why: string) =>
+		new Error(
+			`PUBLIC_URL ${JSON.stringify(value)} ${why} Fix it in wrangler.jsonc, then redeploy.`,
+		);
+
+	let url: URL;
+	try {
+		url = new URL(value.trim());
+	} catch {
+		throw problem("is not an absolute URL.");
+	}
+	if (url.protocol !== "https:" && url.protocol !== "http:") {
+		throw problem("must use https.");
+	}
+	if (url.protocol === "http:" && !LOOPBACK_HOSTS.has(url.hostname)) {
+		throw problem("must use https; plain http is only allowed for localhost.");
+	}
+	if (url.username || url.password || url.search || url.hash) {
+		throw problem("must not contain credentials, a query string or a fragment.");
+	}
+
+	// Trimmed with a loop, not /\/+$/: that regex backtracks quadratically on a
+	// long run of slashes (CodeQL js/polynomial-redos).
+	let path = url.pathname;
+	while (path.endsWith("/")) {
+		path = path.slice(0, -1);
+	}
+	return `${url.origin}${path}`;
 }
 
 /** Where GitHub sends the browser back after the OAuth handshake. */

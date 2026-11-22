@@ -24,7 +24,7 @@
  */
 
 import { type GrantRef } from "../auth/props";
-import { bytesToBase64Url, base64ToBytes, randomToken } from "../auth/crypto";
+import { randomToken, sealString, unsealString } from "../auth/crypto";
 import { type AppEnv, required } from "../env";
 import type { Actor } from "../github/client";
 
@@ -244,51 +244,19 @@ export async function uploadLinkId(secret: string): Promise<string> {
 }
 
 /**
- * An AES-GCM key derived from the link's secret and a Worker secret. The link
- * secret is the input key material; the Worker secret, as the HKDF salt, is
- * what stops the link alone from opening the row. GITHUB_CLIENT_SECRET is used
+ * The link's secret is the input key material and GITHUB_CLIENT_SECRET the HKDF
+ * salt, so the link alone cannot open the row. GITHUB_CLIENT_SECRET is used
  * because every deployment already has it; rotating it leaves links made
  * before the rotation unable to act as the user, and they expire within
  * fifteen minutes. The info string keeps the key distinct from the SHA-256
  * used as the row id, which is stored in the clear.
  */
-async function sealingKey(env: AppEnv, secret: string): Promise<CryptoKey> {
-	const material = await crypto.subtle.importKey("raw", encoder.encode(secret), "HKDF", false, [
-		"deriveKey",
-	]);
-	return crypto.subtle.deriveKey(
-		{
-			name: "HKDF",
-			hash: "SHA-256",
-			salt: encoder.encode(required(env, "GITHUB_CLIENT_SECRET")),
-			info: encoder.encode("github-issues-mcp upload link token seal v2"),
-		},
-		material,
-		{ name: "AES-GCM", length: 256 },
-		false,
-		["encrypt", "decrypt"],
-	);
+const SEAL_INFO = "github-issues-mcp upload link token seal v2";
+
+function seal(env: AppEnv, secret: string, plaintext: string): Promise<string> {
+	return sealString(required(env, "GITHUB_CLIENT_SECRET"), secret, SEAL_INFO, plaintext);
 }
 
-async function seal(env: AppEnv, secret: string, plaintext: string): Promise<string> {
-	const iv = crypto.getRandomValues(new Uint8Array(12));
-	const ciphertext = await crypto.subtle.encrypt(
-		{ name: "AES-GCM", iv },
-		await sealingKey(env, secret),
-		encoder.encode(plaintext),
-	);
-	const out = new Uint8Array(iv.length + ciphertext.byteLength);
-	out.set(iv);
-	out.set(new Uint8Array(ciphertext), iv.length);
-	return bytesToBase64Url(out);
-}
-
-async function unseal(env: AppEnv, secret: string, sealed: string): Promise<string> {
-	const bytes = base64ToBytes(sealed);
-	const plaintext = await crypto.subtle.decrypt(
-		{ name: "AES-GCM", iv: bytes.slice(0, 12) },
-		await sealingKey(env, secret),
-		bytes.slice(12),
-	);
-	return new TextDecoder().decode(plaintext);
+function unseal(env: AppEnv, secret: string, sealed: string): Promise<string> {
+	return unsealString(required(env, "GITHUB_CLIENT_SECRET"), secret, SEAL_INFO, sealed);
 }
