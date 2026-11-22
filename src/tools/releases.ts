@@ -36,7 +36,7 @@ const RELEASE_UNTRUSTED = ["name", "body"];
 /**
  * The publish_release and promote_release fields that carry contributor-written
  * text: the release title, and workflow names, file paths and the note quoting
- * them, all read from files at the tagged commit.
+ * them, all read from files at the tagged commit or on the default branch.
  */
 const PREVIEW_UNTRUSTED = [
 	"release.name",
@@ -46,8 +46,12 @@ const PREVIEW_UNTRUSTED = [
 	"workflows.triggered_by_tag_creation[].path",
 	"workflows.triggered_by_workflow_run[].name",
 	"workflows.triggered_by_workflow_run[].path",
+	"workflows.possibly_triggered_by_workflow_run[].name",
+	"workflows.possibly_triggered_by_workflow_run[].path",
 	"workflows.unanalysed[]",
+	"workflows.unanalysed_on_default_branch[]",
 	"workflows.unchecked_files[]",
+	"workflows.unchecked_files_on_default_branch[]",
 	"workflows.note",
 ];
 
@@ -953,8 +957,12 @@ export async function confirmToken(
 			| "triggered_by_release"
 			| "triggered_by_tag_creation"
 			| "triggered_by_workflow_run"
+			| "possibly_triggered_by_workflow_run"
 			| "unanalysed"
 			| "unchecked_files"
+			| "unanalysed_on_default_branch"
+			| "unchecked_files_on_default_branch"
+			| "default_branch_unreadable"
 		>;
 	},
 ): Promise<string> {
@@ -978,6 +986,10 @@ export async function confirmToken(
 		paths(state.workflows?.triggered_by_workflow_run),
 		names(state.workflows?.unanalysed),
 		names(state.workflows?.unchecked_files),
+		paths(state.workflows?.possibly_triggered_by_workflow_run),
+		names(state.workflows?.unanalysed_on_default_branch),
+		names(state.workflows?.unchecked_files_on_default_branch),
+		state.workflows?.default_branch_unreadable ?? null,
 	]);
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(fingerprint));
 	return [...new Uint8Array(digest).slice(0, 8)]

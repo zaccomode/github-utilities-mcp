@@ -4,6 +4,7 @@ import { createMcpHandler } from "agents/mcp/server";
 import { describe, expect, it } from "vitest";
 import type { AppEnv } from "../src/env";
 import type { TokenSource } from "../src/github/client";
+import { MCP_HANDLER_OPTIONS } from "../src/index";
 import { createGitHubIssuesServer } from "../src/tools";
 
 /**
@@ -24,7 +25,11 @@ describe("the MCP endpoint", () => {
 		},
 	};
 
-	async function call(body: unknown, sessionId?: string) {
+	async function call(
+		body: unknown,
+		sessionId?: string,
+		extra: { headers?: Record<string, string>; options?: object } = {},
+	) {
 		const server = createGitHubIssuesServer({
 			env: env as unknown as AppEnv,
 			creds: { app: source, user: source, as: () => source },
@@ -40,13 +45,14 @@ describe("the MCP endpoint", () => {
 			waitUntil: () => undefined,
 		});
 		const ctx = createExecutionContext();
-		const response = await createMcpHandler(() => server, { route: "/mcp" })(
+		const response = await createMcpHandler(() => server, extra.options ?? MCP_HANDLER_OPTIONS)(
 			new Request("https://example.com/mcp", {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 					Accept: "application/json, text/event-stream",
 					...(sessionId ? { "mcp-session-id": sessionId } : {}),
+					...extra.headers,
 				},
 				body: JSON.stringify(body),
 			}),
@@ -117,5 +123,18 @@ describe("the MCP endpoint", () => {
 		expect(body.error ?? body.result?.isError).toBeTruthy();
 		expect(error).toMatch(/issue_number/);
 		expect(error).not.toMatch(/No GitHub calls/);
+	});
+
+	it("accepts browser-based clients that send an Origin header", async () => {
+		const ping = { jsonrpc: "2.0", id: 4, method: "ping", params: {} };
+		const headers = { Origin: "https://inspector.example.com" };
+
+		// What agents does without the option, and why it is set.
+		const defaults = await call(ping, undefined, { headers, options: { route: "/mcp" } });
+		expect(defaults.status).toBe(403);
+
+		const response = await call(ping, undefined, { headers });
+		expect(response.status).toBe(200);
+		expect((await json(response)).result).toEqual({});
 	});
 });

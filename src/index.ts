@@ -2,7 +2,9 @@ import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
 import { authorizeHandler } from "./auth/handler";
 import { type GrantProps, grantRefFromRequest, isGrantProps } from "./auth/props";
-import { ReauthorizationRequired, refreshUserToken } from "./auth/user-oauth";
+import { RefreshInProgress, renewUserToken } from "./auth/refresh";
+import { ReauthorizationRequired } from "./auth/user-oauth";
+import { handleWebhook } from "./auth/webhook";
 import { installationStatus } from "./db/tenants";
 import { checkQuota } from "./db/usage";
 import { type AppEnv, publicUrl } from "./env";
@@ -11,6 +13,17 @@ import { problem } from "./http";
 import { createGitHubIssuesServer } from "./tools";
 
 const MCP_ROUTE = "/mcp";
+
+export const MCP_HANDLER_OPTIONS = {
+	route: MCP_ROUTE,
+	// The handler's default Origin check accepts only localhost and the
+	// workers.dev host, so browser-based clients (a hosted MCP Inspector, the
+	// AI Playground) got 403 with a valid token. The check guards against
+	// cookie-carrying cross-site requests. Here every request carries a bearer
+	// token the OAuth provider has already checked, and no cookie is ever read,
+	// so there is nothing for it to protect.
+	allowedOriginHostnames: "*",
+} as const;
 
 /**
  * Deliberately far shorter than the eight hours GitHub gives a user token. The
@@ -92,7 +105,7 @@ const mcpApiHandler = {
 			waitUntil: (promise) => ctx.waitUntil(promise),
 		});
 
-		return createMcpHandler(() => server, { route: MCP_ROUTE })(request, env, ctx);
+		return createMcpHandler(() => server, MCP_HANDLER_OPTIONS)(request, env, ctx);
 	},
 };
 
@@ -136,17 +149,28 @@ function getProvider(env: AppEnv): OAuthProvider<AppEnv> {
 			}
 
 			try {
-				const renewed = await refreshUserToken(env, current.user.refreshToken);
+				// Concurrent refreshes of one grant share a single GitHub call;
+				// see src/auth/refresh.ts.
+				const renewed = await renewUserToken(env, current.user);
 				return {
 					newProps: { ...current, user: renewed },
 					accessTokenTTL: ACCESS_TOKEN_TTL,
 				};
 			} catch (error) {
-				// A spent or revoked refresh token is terminal. Since 1.1, throwing
+				// A spent or revoked refresh token, with no concurrent refresh
+				// holding its replacement, is terminal. Since 1.1, throwing
 				// `invalid_grant` here also revokes the grant, and the client sends
 				// the user back through consent.
 				if (error instanceof ReauthorizationRequired) {
 					throw new OAuthError("invalid_grant", { description: error.message });
+				}
+				// Never `invalid_grant`: the grant is fine, the client should retry.
+				if (error instanceof RefreshInProgress) {
+					throw new OAuthError("temporarily_unavailable", {
+						description: error.message,
+						statusCode: 503,
+						headers: { "Retry-After": "5" },
+					});
 				}
 				throw error;
 			}
@@ -156,7 +180,31 @@ function getProvider(env: AppEnv): OAuthProvider<AppEnv> {
 }
 
 export default {
-	fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
-		return (getProvider(env) as any).fetch(request, env, ctx);
+	async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
+		// Routes that need nothing from the OAuth provider are answered before
+		// it is built, so a bad PUBLIC_URL (which makes building it throw)
+		// cannot take the health check or webhook delivery down with it.
+		const { pathname } = new URL(request.url);
+		if (pathname === "/healthz") {
+			return new Response("ok\n", { headers: { "Content-Type": "text/plain" } });
+		}
+		if (pathname === "/webhooks/github") {
+			try {
+				return await handleWebhook(request, env);
+			} catch (error) {
+				console.error("Webhook handling failed:", error);
+				return problem(500, "The webhook could not be processed.");
+			}
+		}
+
+		let oauth: OAuthProvider<AppEnv>;
+		try {
+			oauth = getProvider(env);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error("Could not start the OAuth provider:", message);
+			return problem(500, `This server is misconfigured: ${message}`);
+		}
+		return (oauth as any).fetch(request, env, ctx);
 	},
 };
