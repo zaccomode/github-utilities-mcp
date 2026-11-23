@@ -63,13 +63,21 @@ export async function exchangeCode(env: AppEnv, code: string): Promise<UserToken
  * `tokenExchangeCallback` in src/index.ts, which is the only place this is
  * called from.
  */
-export async function refreshUserToken(env: AppEnv, refreshToken: string): Promise<UserTokenSet> {
-	return tokenRequest(env, {
-		client_id: required(env, "GITHUB_CLIENT_ID"),
-		client_secret: required(env, "GITHUB_CLIENT_SECRET"),
-		grant_type: "refresh_token",
-		refresh_token: refreshToken,
-	});
+export async function refreshUserToken(
+	env: AppEnv,
+	refreshToken: string,
+	signal?: AbortSignal,
+): Promise<UserTokenSet> {
+	return tokenRequest(
+		env,
+		{
+			client_id: required(env, "GITHUB_CLIENT_ID"),
+			client_secret: required(env, "GITHUB_CLIENT_SECRET"),
+			grant_type: "refresh_token",
+			refresh_token: refreshToken,
+		},
+		signal,
+	);
 }
 
 /** Thrown when GitHub says the refresh token is spent or revoked. */
@@ -83,9 +91,14 @@ export class ReauthorizationRequired extends Error {
 	}
 }
 
-async function tokenRequest(env: AppEnv, params: Record<string, string>): Promise<UserTokenSet> {
+async function tokenRequest(
+	env: AppEnv,
+	params: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<UserTokenSet> {
 	const response = await fetch(`${GITHUB_OAUTH}/login/oauth/access_token`, {
 		method: "POST",
+		signal,
 		headers: {
 			Accept: "application/json",
 			"Content-Type": "application/x-www-form-urlencoded",

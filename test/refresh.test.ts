@@ -16,7 +16,7 @@ const appEnv = env as unknown as AppEnv;
 /** Refresh tokens GitHub will still accept. Each works once. */
 let unspent: Set<string>;
 let githubCalls: string[];
-let failNextWith: "network" | undefined;
+let failNextWith: "network" | "hang" | undefined;
 
 function pair(refreshToken: string): UserTokenSet {
 	return {
@@ -38,6 +38,13 @@ beforeEach(() => {
 		}
 		const token = new URLSearchParams(String(init?.body)).get("refresh_token") ?? "";
 		githubCalls.push(token);
+		if (failNextWith === "hang") {
+			failNextWith = undefined;
+			// Never answers; only the caller's abort signal ends it.
+			await new Promise((_, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+			});
+		}
 		// Slow enough that a concurrent refresh arrives while this one is in flight.
 		await new Promise((resolve) => setTimeout(resolve, 50));
 		if (failNextWith === "network") {
@@ -65,6 +72,28 @@ beforeEach(() => {
 afterEach(() => {
 	vi.restoreAllMocks();
 });
+
+async function rowIdFor(refreshToken: string): Promise<string> {
+	const { sha256Hex } = await import("../src/auth/crypto");
+	return sha256Hex(`github-issues-mcp refresh ${refreshToken}`);
+}
+
+/** Leaves a claim on `refreshToken` that has had no pair for `ageMs`. */
+async function staleClaim(refreshToken: string, ageMs: number): Promise<void> {
+	const claimedAt = Date.now() - ageMs;
+	await appEnv.DB.prepare(
+		`INSERT INTO token_refreshes (id, sealed_tokens, claimed_at, expires_at)
+		 VALUES (?1, NULL, ?2, ?3)`,
+	)
+		.bind(await rowIdFor(refreshToken), claimedAt, Date.now() + 60_000)
+		.run();
+}
+
+async function rowFor(refreshToken: string) {
+	return appEnv.DB.prepare(`SELECT sealed_tokens FROM token_refreshes WHERE id = ?1`)
+		.bind(await rowIdFor(refreshToken))
+		.first<{ sealed_tokens: string | null }>();
+}
 
 describe("renewUserToken", () => {
 	it("gives two concurrent refreshes the same pair from one GitHub call", async () => {
@@ -144,6 +173,77 @@ describe("renewUserToken", () => {
 			renewUserToken(appEnv, pair("slow-1"), { waitMs: 100, pollMs: 20 }),
 		).rejects.toBeInstanceOf(RefreshInProgress);
 		expect(githubCalls).toEqual([]);
+	});
+
+	it("does not report a dead grant after taking over a claim whose holder spent the token", async () => {
+		// The holder spent "takeover-1" (it is not in `unspent`) and wrote the
+		// new pair into the grant, but never recorded it here.
+		await staleClaim("takeover-1", 31_000);
+		await expect(renewUserToken(appEnv, pair("takeover-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(githubCalls).toEqual(["takeover-1"]);
+		// The claim is released, so a genuinely dead token is still reported
+		// on the next, unraced attempt.
+		expect(await rowFor("takeover-1")).toBeNull();
+		await expect(renewUserToken(appEnv, pair("takeover-1"))).rejects.toBeInstanceOf(
+			ReauthorizationRequired,
+		);
+	});
+
+	it("still renews normally after taking over an abandoned claim", async () => {
+		unspent.add("takeover-2");
+		await staleClaim("takeover-2", 31_000);
+		const renewed = await renewUserToken(appEnv, pair("takeover-2"));
+		expect(renewed.accessToken).toBe("access-for-takeover-2");
+	});
+
+	it("abandons a GitHub call that outlasts its timeout and releases the claim", async () => {
+		unspent.add("hang-1");
+		failNextWith = "hang";
+		await expect(
+			renewUserToken(appEnv, pair("hang-1"), { githubTimeoutMs: 100 }),
+		).rejects.toThrow();
+		expect(await rowFor("hang-1")).toBeNull();
+	});
+
+	it("retries recording the pair once when the first write fails", async () => {
+		unspent.add("seal-1");
+		let failures = 0;
+		const flakyDb = new Proxy(appEnv.DB, {
+			get(target, key, receiver) {
+				if (key === "prepare") {
+					return (sql: string) => {
+						const statement = target.prepare(sql);
+						if (sql.includes("SET sealed_tokens") && failures === 0) {
+							failures++;
+							return {
+								bind: () => ({
+									run: () => Promise.reject(new Error("D1_ERROR: transient")),
+								}),
+							};
+						}
+						return statement;
+					};
+				}
+				return Reflect.get(target, key, receiver);
+			},
+		});
+		const renewed = await renewUserToken({ ...appEnv, DB: flakyDb } as AppEnv, pair("seal-1"));
+		expect(failures).toBe(1);
+		expect((await rowFor("seal-1"))?.sealed_tokens).toBeTruthy();
+		// A latecomer gets the recorded pair without calling GitHub.
+		const late = await renewUserToken(appEnv, pair("seal-1"));
+		expect(late).toEqual(renewed);
+		expect(githubCalls).toEqual(["seal-1"]);
+	});
+
+	it("can run its housekeeping off the critical path", async () => {
+		unspent.add("defer-1");
+		const deferred: Promise<unknown>[] = [];
+		await renewUserToken(appEnv, pair("defer-1"), { defer: (p) => deferred.push(p) });
+		expect(deferred).toHaveLength(1);
+		await Promise.all(deferred);
 	});
 
 	it("stores nothing a reader of D1 could use as a credential", async () => {

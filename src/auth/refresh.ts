@@ -20,13 +20,20 @@
 
 import { sealString, sha256Hex, unsealString } from "./crypto";
 import { type AppEnv, required } from "../env";
-import { type UserTokenSet, refreshUserToken } from "./user-oauth";
+import { ReauthorizationRequired, type UserTokenSet, refreshUserToken } from "./user-oauth";
 
 /** How long a finished refresh's pair stays available to latecomers. */
 const HANDOFF_TTL_MS = 10 * 60 * 1000;
 
 /** A claim older than this with no pair is treated as abandoned. */
 const CLAIM_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * The longest a claimer waits for GitHub. Well under `CLAIM_TIMEOUT_MS`, so a
+ * claimer can never still be spending the refresh token when somebody else
+ * takes its claim over.
+ */
+const GITHUB_TIMEOUT_MS = 15 * 1000;
 
 /** How many spent tokens are followed when a pair has itself been refreshed. */
 const MAX_HOPS = 5;
@@ -38,6 +45,13 @@ export interface RenewOptions {
 	waitMs?: number;
 	/** How often to look while waiting. */
 	pollMs?: number;
+	/** How long the GitHub token request may take before it is abandoned. */
+	githubTimeoutMs?: number;
+	/**
+	 * Runs housekeeping off the critical path, e.g. `waitUntil` from
+	 * `cloudflare:workers`. Without it the housekeeping is awaited.
+	 */
+	defer?: (promise: Promise<unknown>) => void;
 }
 
 export class RefreshInProgress extends Error {
@@ -58,7 +72,7 @@ export async function renewUserToken(
 	current: UserTokenSet,
 	options: RenewOptions = {},
 ): Promise<UserTokenSet> {
-	const { waitMs = 8000, pollMs = 150 } = options;
+	const { waitMs = 8000, pollMs = 150, githubTimeoutMs = GITHUB_TIMEOUT_MS, defer } = options;
 	const refreshToken = current.refreshToken;
 	if (!refreshToken) {
 		// Nothing to race over: GitHub issued no refresh token, so this fails
@@ -67,13 +81,19 @@ export async function renewUserToken(
 	}
 
 	const id = await rowId(refreshToken);
-	await sweep(env).catch(() => undefined);
+	const swept = sweep(env).catch(() => undefined);
+	if (defer) {
+		defer(swept);
+	} else {
+		await swept;
+	}
 
 	// A second pass covers a claimer that failed and released its claim: this
 	// refresh then tries GitHub itself.
 	for (let attempt = 0; attempt < 2; attempt++) {
-		if (await claim(env, id)) {
-			return refreshAsClaimer(env, id, refreshToken);
+		const claimed = await claim(env, id);
+		if (claimed) {
+			return refreshAsClaimer(env, id, refreshToken, claimed === "takeover", githubTimeoutMs);
 		}
 
 		const deadline = Date.now() + waitMs;
@@ -117,44 +137,66 @@ async function refreshAsClaimer(
 	env: AppEnv,
 	id: string,
 	refreshToken: string,
+	tookOver: boolean,
+	githubTimeoutMs: number,
 ): Promise<UserTokenSet> {
 	let renewed: UserTokenSet;
 	try {
-		renewed = await refreshUserToken(env, refreshToken);
+		renewed = await refreshUserToken(env, refreshToken, AbortSignal.timeout(githubTimeoutMs));
 	} catch (error) {
 		// Release the claim so anyone waiting stops waiting.
 		await env.DB.prepare(`DELETE FROM token_refreshes WHERE id = ?1 AND sealed_tokens IS NULL`)
 			.bind(id)
 			.run()
 			.catch(() => undefined);
+		// The claim this refresh took over may have been abandoned only in
+		// appearance: its holder can have spent the token and failed to record
+		// the pair, which is now in the grant. Calling the grant dead would
+		// revoke it, so ask the client to retry instead. If the token really is
+		// dead, the retry claims afresh and reports it then.
+		if (tookOver && error instanceof ReauthorizationRequired) {
+			throw new RefreshInProgress();
+		}
 		throw error;
 	}
 
+	let sealed: string;
 	try {
-		const sealed = await sealString(
+		sealed = await sealString(
 			required(env, "GITHUB_CLIENT_SECRET"),
 			refreshToken,
 			SEAL_INFO,
 			JSON.stringify(renewed),
 		);
-		await env.DB.prepare(
-			`UPDATE token_refreshes SET sealed_tokens = ?2, expires_at = ?3 WHERE id = ?1`,
-		)
-			.bind(id, sealed, Date.now() + HANDOFF_TTL_MS)
-			.run();
 	} catch (error) {
-		// The pair is good and this refresh returns it; only a concurrent one
-		// loses out, and it fails as before.
-		console.error("Could not record a refreshed token pair:", error);
+		console.error("Could not seal a refreshed token pair:", error);
+		return renewed;
+	}
+	for (let attempt = 1; attempt <= 2; attempt++) {
+		try {
+			await env.DB.prepare(
+				`UPDATE token_refreshes SET sealed_tokens = ?2, expires_at = ?3 WHERE id = ?1`,
+			)
+				.bind(id, sealed, Date.now() + HANDOFF_TTL_MS)
+				.run();
+			break;
+		} catch (error) {
+			// The pair is good and this refresh returns it; only a concurrent
+			// one loses out, and it is told to retry rather than reauthorise.
+			if (attempt === 2) {
+				console.error("Could not record a refreshed token pair:", error);
+			}
+		}
 	}
 	return renewed;
 }
 
 /**
  * Takes the row for `id`: inserts it, or takes over a claim whose holder has
- * gone quiet without leaving a pair. True when this refresh should call GitHub.
+ * gone quiet without leaving a pair. Truthy when this refresh should call
+ * GitHub, and `"takeover"` when someone else claimed the token first.
  */
-async function claim(env: AppEnv, id: string): Promise<boolean> {
+async function claim(env: AppEnv, id: string): Promise<"fresh" | "takeover" | false> {
 	const now = Date.now();
 	const inserted = await env.DB.prepare(
 		`INSERT INTO token_refreshes (id, sealed_tokens, claimed_at, expires_at)
@@ -164,7 +206,7 @@ async function claim(env: AppEnv, id: string): Promise<boolean> {
 		.bind(id, now, now + HANDOFF_TTL_MS)
 		.run();
 	if (inserted.meta.changes === 1) {
-		return true;
+		return "fresh";
 	}
 	const takenOver = await env.DB.prepare(
 		`UPDATE token_refreshes SET claimed_at = ?2, expires_at = ?3
@@ -172,7 +214,7 @@ async function claim(env: AppEnv, id: string): Promise<boolean> {
 	)
 		.bind(id, now, now + HANDOFF_TTL_MS, now - CLAIM_TIMEOUT_MS)
 		.run();
-	return takenOver.meta.changes === 1;
+	return takenOver.meta.changes === 1 ? "takeover" : false;
 }
 
 /**
