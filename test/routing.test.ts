@@ -33,12 +33,12 @@ describe("with an invalid PUBLIC_URL", () => {
 		expect(response.status).not.toBe(500);
 	});
 
-	it("names the setting on every other route", async () => {
+	it("fails every other route without saying which setting is wrong", async () => {
 		const response = await get("/authorize");
 		expect(response.status).toBe(500);
-		expect(((await response.json()) as { error: string }).error).toMatch(
-			/PUBLIC_URL .* must use https/,
-		);
+		const { error } = (await response.json()) as { error: string };
+		expect(error).toBe("This server is misconfigured.");
+		expect(error).not.toMatch(/PUBLIC_URL|https|example\.com/);
 	});
 });
 

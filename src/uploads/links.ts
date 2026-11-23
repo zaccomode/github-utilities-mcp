@@ -24,7 +24,7 @@
  */
 
 import { type GrantRef } from "../auth/props";
-import { randomToken, sealString, unsealString } from "../auth/crypto";
+import { randomToken, sealString, sha256Hex, unsealString } from "../auth/crypto";
 import { type AppEnv, required } from "../env";
 import type { Actor } from "../github/client";
 
@@ -235,12 +235,9 @@ export async function sweepUploadLinks(env: AppEnv): Promise<void> {
 
 // ----------------------------------------------------------------- crypto
 
-const encoder = new TextEncoder();
-
 /** A link's id: the hex SHA-256 of its secret. Not secret; it names the row. */
-export async function uploadLinkId(secret: string): Promise<string> {
-	const digest = await crypto.subtle.digest("SHA-256", encoder.encode(secret));
-	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+export function uploadLinkId(secret: string): Promise<string> {
+	return sha256Hex(secret);
 }
 
 /**
