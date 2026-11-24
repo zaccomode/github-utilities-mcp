@@ -1,3 +1,4 @@
+import { waitUntil } from "cloudflare:workers";
 import { OAuthError, OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
 import { authorizeHandler } from "./auth/handler";
@@ -151,7 +152,7 @@ function getProvider(env: AppEnv): OAuthProvider<AppEnv> {
 			try {
 				// Concurrent refreshes of one grant share a single GitHub call;
 				// see src/auth/refresh.ts.
-				const renewed = await renewUserToken(env, current.user);
+				const renewed = await renewUserToken(env, current.user, { defer: waitUntil });
 				return {
 					newProps: { ...current, user: renewed },
 					accessTokenTTL: ACCESS_TOKEN_TTL,
@@ -203,7 +204,9 @@ export default {
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error("Could not start the OAuth provider:", message);
-			return problem(500, `This server is misconfigured: ${message}`);
+			// The detail can name a missing secret or echo a bad setting, so it
+			// stays in the log and the caller, who may be anyone, learns nothing.
+			return problem(500, "This server is misconfigured.");
 		}
 		return (oauth as any).fetch(request, env, ctx);
 	},

@@ -311,6 +311,22 @@ describe("publish_release", () => {
 		);
 	});
 
+	it("keeps a consumer whose name an unanalysed file may share with a non-starting one", async () => {
+		// ci.yml parses and does not start on release; ci-release.yml is also
+		// named CI, cannot be parsed, and is the one that may run.
+		state.workflows["ci.yml"] = "name: CI\non: [pull_request]\n";
+		state.workflows["ci-release.yml"] = "name: CI\non: [release\n";
+		state.defaultWorkflows = {
+			...state.workflows,
+			"after-ci.yml": "name: After CI\non:\n  workflow_run:\n    workflows: [CI]\n",
+		};
+		const preview = await publish({ release_id: 1 });
+		expect(preview.workflows.unanalysed).toEqual([".github/workflows/ci-release.yml"]);
+		expect(preview.workflows.possibly_triggered_by_workflow_run).toEqual([
+			{ path: ".github/workflows/after-ci.yml", name: "After CI" },
+		]);
+	});
+
 	it("refuses confirm without a token", async () => {
 		await expect(publish({ release_id: 1, confirm: true })).rejects.toThrow(
 			/needs the confirm_token/,

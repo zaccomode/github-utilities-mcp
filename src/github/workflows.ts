@@ -189,12 +189,11 @@ export function workflowRunChain(
 	all: { path: string; workflow: ParsedWorkflow }[],
 	started: { path: string; workflow: ParsedWorkflow }[],
 ): { path: string; workflow: ParsedWorkflow }[] {
-	const label = workflowLabel;
 	const seen = new Set<string>();
 	const found: { path: string; workflow: ParsedWorkflow }[] = [];
 	let frontier = started;
 	for (let depth = 0; depth < MAX_WORKFLOW_RUN_DEPTH && frontier.length; depth++) {
-		const names = new Set(frontier.map(label));
+		const names = new Set(frontier.map(workflowLabel));
 		frontier = all.filter(
 			(w) =>
 				!seen.has(w.path) &&
@@ -436,9 +435,10 @@ export async function releaseWorkflows(
 			byWorkflowRun = workflowRunChain(all, started);
 
 			if (unknownAtRef) {
-				// A consumer waiting for a name no parsed workflow at the ref has may
-				// be waiting for one of the unanalysed files.
-				const known = new Set(parsed.map(workflowLabel));
+				// A consumer waiting for a name no starting workflow at the ref has
+				// may be waiting for one of the unanalysed files, even when a parsed
+				// workflow that does not start shares that name.
+				const known = new Set(started.map(workflowLabel));
 				const listed = new Set(byWorkflowRun.map((w) => w.path));
 				const unresolved = all.filter(
 					(w) =>
