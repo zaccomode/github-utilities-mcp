@@ -90,9 +90,18 @@ async function staleClaim(refreshToken: string, ageMs: number): Promise<void> {
 }
 
 async function rowFor(refreshToken: string) {
-	return appEnv.DB.prepare(`SELECT sealed_tokens FROM token_refreshes WHERE id = ?1`)
+	return appEnv.DB.prepare(
+		`SELECT sealed_tokens, outcome_unknown FROM token_refreshes WHERE id = ?1`,
+	)
 		.bind(await rowIdFor(refreshToken))
-		.first<{ sealed_tokens: string | null }>();
+		.first<{ sealed_tokens: string | null; outcome_unknown: number }>();
+}
+
+/** Lets an "outcome unknown" mark on `refreshToken` lapse. */
+async function lapse(refreshToken: string): Promise<void> {
+	await appEnv.DB.prepare(`UPDATE token_refreshes SET expires_at = ?2 WHERE id = ?1`)
+		.bind(await rowIdFor(refreshToken), Date.now() - 1)
+		.run();
 }
 
 describe("renewUserToken", () => {
@@ -183,12 +192,56 @@ describe("renewUserToken", () => {
 			RefreshInProgress,
 		);
 		expect(githubCalls).toEqual(["takeover-1"]);
-		// The claim is released, so a genuinely dead token is still reported
-		// on the next, unraced attempt.
-		expect(await rowFor("takeover-1")).toBeNull();
+		// The row stays, marked, so nobody claims it afresh while the grant may
+		// still be catching up.
+		expect((await rowFor("takeover-1"))?.outcome_unknown).toBe(1);
+		// Once the mark lapses, a genuinely dead token is still reported.
+		await lapse("takeover-1");
 		await expect(renewUserToken(appEnv, pair("takeover-1"))).rejects.toBeInstanceOf(
 			ReauthorizationRequired,
 		);
+		expect(githubCalls).toEqual(["takeover-1", "takeover-1"]);
+	});
+
+	it("does not report a dead grant to a refresh waiting alongside a takeover", async () => {
+		await staleClaim("takeover-9", 31_000);
+		const results = await Promise.allSettled([
+			renewUserToken(appEnv, pair("takeover-9")),
+			renewUserToken(appEnv, pair("takeover-9")),
+		]);
+		for (const result of results) {
+			expect(result.status).toBe("rejected");
+			expect((result as PromiseRejectedResult).reason).toBeInstanceOf(RefreshInProgress);
+		}
+		expect(githubCalls).toEqual(["takeover-9"]);
+	});
+
+	it("keeps asking a client that retries after the 503 to wait while the mark is live", async () => {
+		await staleClaim("takeover-10", 31_000);
+		await expect(renewUserToken(appEnv, pair("takeover-10"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		// The retry carries the same pair, as it would if it read stale props.
+		await expect(renewUserToken(appEnv, pair("takeover-10"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(githubCalls).toEqual(["takeover-10"]);
+	});
+
+	it("claims a lapsed mark afresh even before it is swept", async () => {
+		await staleClaim("takeover-11", 31_000);
+		await expect(renewUserToken(appEnv, pair("takeover-11"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		// Lapsed, but not yet swept: the next refresh claims it afresh, so a
+		// dead token is reported rather than retried forever.
+		await appEnv.DB.prepare(`UPDATE token_refreshes SET expires_at = ?2 WHERE id = ?1`)
+			.bind(await rowIdFor("takeover-11"), Date.now() + 50)
+			.run();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		await expect(
+			renewUserToken(appEnv, pair("takeover-11"), { defer: () => undefined }),
+		).rejects.toBeInstanceOf(ReauthorizationRequired);
 	});
 
 	it("still renews normally after taking over an abandoned claim", async () => {
@@ -203,8 +256,20 @@ describe("renewUserToken", () => {
 		failNextWith = "hang";
 		await expect(
 			renewUserToken(appEnv, pair("hang-1"), { githubTimeoutMs: 100 }),
-		).rejects.toThrow();
+		).rejects.toBeInstanceOf(RefreshInProgress);
 		expect(await rowFor("hang-1")).toBeNull();
+		// The token was never spent, so the retry renews it.
+		const renewed = await renewUserToken(appEnv, pair("hang-1"));
+		expect(renewed.accessToken).toBe("access-for-hang-1");
+	});
+
+	it("asks the client to retry when GitHub cannot be reached", async () => {
+		unspent.add("offline-1");
+		failNextWith = "network";
+		await expect(renewUserToken(appEnv, pair("offline-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(await rowFor("offline-1")).toBeNull();
 	});
 
 	it("retries recording the pair once when the first write fails", async () => {

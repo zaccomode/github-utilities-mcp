@@ -16,6 +16,12 @@
  * racer agrees on one pair and nobody revokes anything. The row outlives the
  * race for a few minutes, which also covers a client retrying a refresh whose
  * response it lost.
+ *
+ * A refresh that takes over an abandoned claim and is told the token is spent
+ * cannot tell a dead grant from one whose earlier claimer spent the token and
+ * saved the new pair into the grant without recording it here. It leaves the
+ * row marked "outcome unknown" for a while, and until the mark lapses every
+ * refresh of that token is asked to retry rather than told to reauthorise.
  */
 
 import { sealString, sha256Hex, unsealString } from "./crypto";
@@ -34,6 +40,14 @@ const CLAIM_TIMEOUT_MS = 30 * 1000;
  * takes its claim over.
  */
 const GITHUB_TIMEOUT_MS = 15 * 1000;
+
+/**
+ * How long a token whose outcome is unknown (see `markOutcomeUnknown`) keeps
+ * every refresh of it waiting. Long enough to outlast KV serving a grant's old
+ * props in another colo (up to about a minute) plus a client's retries, short
+ * enough that a token that really is dead is reported soon after.
+ */
+const OUTCOME_UNKNOWN_TTL_MS = 2 * 60 * 1000;
 
 /** How many spent tokens are followed when a pair has itself been refreshed. */
 const MAX_HOPS = 5;
@@ -100,12 +114,26 @@ export async function renewUserToken(
 		let released = false;
 		while (!released) {
 			const row = await env.DB.prepare(
-				`SELECT sealed_tokens, claimed_at FROM token_refreshes WHERE id = ?1`,
+				`SELECT sealed_tokens, claimed_at, expires_at, outcome_unknown
+				 FROM token_refreshes WHERE id = ?1`,
 			)
 				.bind(id)
-				.first<{ sealed_tokens: string | null; claimed_at: number }>();
+				.first<{
+					sealed_tokens: string | null;
+					claimed_at: number;
+					expires_at: number;
+					outcome_unknown: number;
+				}>();
 
 			if (!row) {
+				released = true;
+				break;
+			}
+			if (row.outcome_unknown) {
+				if (Date.now() < row.expires_at) {
+					throw new RefreshInProgress();
+				}
+				// The mark has lapsed: claim() replaces it with a fresh claim.
 				released = true;
 				break;
 			}
@@ -144,17 +172,24 @@ async function refreshAsClaimer(
 	try {
 		renewed = await refreshUserToken(env, refreshToken, AbortSignal.timeout(githubTimeoutMs));
 	} catch (error) {
+		// The claim this refresh took over may have been abandoned only in
+		// appearance: its holder can have spent the token and failed to record
+		// the pair, which is now in the grant. Calling the grant dead would
+		// revoke it, so mark the outcome unknown, which makes this refresh and
+		// every other one holding the token retry until the mark lapses. If the
+		// token really is dead, a refresh after that reports it.
+		if (tookOver && error instanceof ReauthorizationRequired) {
+			await markOutcomeUnknown(env, id);
+			throw new RefreshInProgress();
+		}
 		// Release the claim so anyone waiting stops waiting.
 		await env.DB.prepare(`DELETE FROM token_refreshes WHERE id = ?1 AND sealed_tokens IS NULL`)
 			.bind(id)
 			.run()
 			.catch(() => undefined);
-		// The claim this refresh took over may have been abandoned only in
-		// appearance: its holder can have spent the token and failed to record
-		// the pair, which is now in the grant. Calling the grant dead would
-		// revoke it, so ask the client to retry instead. If the token really is
-		// dead, the retry claims afresh and reports it then.
-		if (tookOver && error instanceof ReauthorizationRequired) {
+		// GitHub being slow or unreachable is temporary: the refresh token was
+		// not spent, so the client should retry rather than see a 500.
+		if (isTransient(error)) {
 			throw new RefreshInProgress();
 		}
 		throw error;
@@ -192,9 +227,45 @@ async function refreshAsClaimer(
 }
 
 /**
- * Takes the row for `id`: inserts it, or takes over a claim whose holder has
- * gone quiet without leaving a pair. Truthy when this refresh should call
- * GitHub, and `"takeover"` when someone else claimed the token first.
+ * Keeps the claim's row, flagged, until `OUTCOME_UNKNOWN_TTL_MS` from now. If
+ * the write fails the row is released instead, which is no worse than before
+ * the flag existed.
+ */
+async function markOutcomeUnknown(env: AppEnv, id: string): Promise<void> {
+	try {
+		await env.DB.prepare(
+			`UPDATE token_refreshes SET outcome_unknown = 1, expires_at = ?2
+			 WHERE id = ?1 AND sealed_tokens IS NULL`,
+		)
+			.bind(id, Date.now() + OUTCOME_UNKNOWN_TTL_MS)
+			.run();
+	} catch (error) {
+		console.error("Could not mark a refresh's outcome unknown:", error);
+		await env.DB.prepare(`DELETE FROM token_refreshes WHERE id = ?1 AND sealed_tokens IS NULL`)
+			.bind(id)
+			.run()
+			.catch(() => undefined);
+	}
+}
+
+/**
+ * A failure that says nothing about the refresh token: the request to GitHub
+ * timed out, was aborted, or never got an answer (`fetch` rejects with a
+ * `TypeError` when the connection fails).
+ */
+function isTransient(error: unknown): boolean {
+	if (error instanceof TypeError) {
+		return true;
+	}
+	const name = (error as { name?: unknown } | null)?.name;
+	return name === "TimeoutError" || name === "AbortError";
+}
+
+/**
+ * Takes the row for `id`: inserts it, replaces an "outcome unknown" mark that
+ * has lapsed, or takes over a claim whose holder has gone quiet without leaving
+ * a pair. Truthy when this refresh should call GitHub, and `"takeover"` when
+ * someone else may have spent the token first.
  */
 async function claim(env: AppEnv, id: string): Promise<"fresh" | "takeover" | false> {
 	const now = Date.now();
@@ -208,9 +279,20 @@ async function claim(env: AppEnv, id: string): Promise<"fresh" | "takeover" | fa
 	if (inserted.meta.changes === 1) {
 		return "fresh";
 	}
+	// A lapsed mark has given any pair it was protecting time to reach the
+	// grant, so a spent token now really does mean a dead grant.
+	const replaced = await env.DB.prepare(
+		`UPDATE token_refreshes SET outcome_unknown = 0, claimed_at = ?2, expires_at = ?3
+		 WHERE id = ?1 AND outcome_unknown = 1 AND expires_at <= ?2`,
+	)
+		.bind(id, now, now + HANDOFF_TTL_MS)
+		.run();
+	if (replaced.meta.changes === 1) {
+		return "fresh";
+	}
 	const takenOver = await env.DB.prepare(
 		`UPDATE token_refreshes SET claimed_at = ?2, expires_at = ?3
-		 WHERE id = ?1 AND sealed_tokens IS NULL AND claimed_at <= ?4`,
+		 WHERE id = ?1 AND sealed_tokens IS NULL AND outcome_unknown = 0 AND claimed_at <= ?4`,
 	)
 		.bind(id, now, now + HANDOFF_TTL_MS, now - CLAIM_TIMEOUT_MS)
 		.run();
