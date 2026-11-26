@@ -16,7 +16,14 @@ const appEnv = env as unknown as AppEnv;
 /** Refresh tokens GitHub will still accept. Each works once. */
 let unspent: Set<string>;
 let githubCalls: string[];
-let failNextWith: "network" | "hang" | undefined;
+let failNextWith:
+	| "network"
+	| "hang"
+	| "html502"
+	| "json503"
+	| "rateLimited"
+	| "badCredentials"
+	| undefined;
 
 function pair(refreshToken: string): UserTokenSet {
 	return {
@@ -50,6 +57,37 @@ beforeEach(() => {
 		if (failNextWith === "network") {
 			failNextWith = undefined;
 			throw new TypeError("Network connection lost.");
+		}
+		if (failNextWith === "html502") {
+			failNextWith = undefined;
+			return new Response("<html><body>502 Bad Gateway</body></html>", {
+				status: 502,
+				headers: { "Content-Type": "text/html" },
+			});
+		}
+		if (failNextWith === "json503") {
+			failNextWith = undefined;
+			return new Response(JSON.stringify({ message: "Service Unavailable" }), {
+				status: 503,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		if (failNextWith === "rateLimited") {
+			failNextWith = undefined;
+			return new Response(JSON.stringify({ message: "Too many requests" }), {
+				status: 429,
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		if (failNextWith === "badCredentials") {
+			failNextWith = undefined;
+			return new Response(
+				JSON.stringify({
+					error: "incorrect_client_credentials",
+					error_description: "The client_id and/or client_secret passed are incorrect.",
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			);
 		}
 		let body: Record<string, unknown>;
 		if (unspent.delete(token)) {
@@ -270,6 +308,99 @@ describe("renewUserToken", () => {
 			RefreshInProgress,
 		);
 		expect(await rowFor("offline-1")).toBeNull();
+	});
+
+	it("asks the client to retry when GitHub answers with a 5xx HTML page", async () => {
+		unspent.add("html-1");
+		failNextWith = "html502";
+		await expect(renewUserToken(appEnv, pair("html-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(await rowFor("html-1")).toBeNull();
+		// GitHub never spent the token, so the retry renews it.
+		const renewed = await renewUserToken(appEnv, pair("html-1"));
+		expect(renewed.accessToken).toBe("access-for-html-1");
+	});
+
+	it("asks the client to retry when GitHub answers a 5xx with no OAuth error", async () => {
+		unspent.add("json503-1");
+		failNextWith = "json503";
+		await expect(renewUserToken(appEnv, pair("json503-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(await rowFor("json503-1")).toBeNull();
+	});
+
+	it("asks the client to retry when GitHub rate-limits the token request", async () => {
+		unspent.add("ratelimit-1");
+		failNextWith = "rateLimited";
+		await expect(renewUserToken(appEnv, pair("ratelimit-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(await rowFor("ratelimit-1")).toBeNull();
+	});
+
+	it("still fails hard on a configuration error such as bad client credentials", async () => {
+		unspent.add("creds-1");
+		failNextWith = "badCredentials";
+		const error = await renewUserToken(appEnv, pair("creds-1")).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(Error);
+		expect(error).not.toBeInstanceOf(RefreshInProgress);
+		expect(error).not.toBeInstanceOf(ReauthorizationRequired);
+		expect(String((error as Error).message)).toContain("incorrect");
+		expect(await rowFor("creds-1")).toBeNull();
+	});
+
+	it("keeps a takeover's row marked when its GitHub call times out", async () => {
+		// The earlier claimer spent "takeover-hang-1" and saved the pair into
+		// the grant without recording it here.
+		await staleClaim("takeover-hang-1", 31_000);
+		failNextWith = "hang";
+		await expect(
+			renewUserToken(appEnv, pair("takeover-hang-1"), { githubTimeoutMs: 100 }),
+		).rejects.toBeInstanceOf(RefreshInProgress);
+		expect((await rowFor("takeover-hang-1"))?.outcome_unknown).toBe(1);
+		// The client retries with the spent token, still inside the KV
+		// staleness window: it is asked to wait, not told to reauthorise.
+		await expect(renewUserToken(appEnv, pair("takeover-hang-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(githubCalls).toEqual(["takeover-hang-1"]);
+		// Once the mark lapses, a token that really is dead is reported.
+		await lapse("takeover-hang-1");
+		await expect(renewUserToken(appEnv, pair("takeover-hang-1"))).rejects.toBeInstanceOf(
+			ReauthorizationRequired,
+		);
+	});
+
+	for (const failure of ["network", "html502", "json503", "badCredentials"] as const) {
+		it(`keeps a takeover's row marked when its GitHub call fails (${failure})`, async () => {
+			const token = `takeover-${failure}`;
+			await staleClaim(token, 31_000);
+			failNextWith = failure;
+			await expect(renewUserToken(appEnv, pair(token))).rejects.toBeInstanceOf(
+				RefreshInProgress,
+			);
+			expect((await rowFor(token))?.outcome_unknown).toBe(1);
+			await expect(renewUserToken(appEnv, pair(token))).rejects.toBeInstanceOf(
+				RefreshInProgress,
+			);
+			expect(githubCalls).toEqual([token]);
+		});
+	}
+
+	it("keeps a takeover's row marked after a 5xx HTML page, then releases it to a fresh claim", async () => {
+		unspent.add("takeover-html-2");
+		await staleClaim("takeover-html-2", 31_000);
+		failNextWith = "html502";
+		await expect(renewUserToken(appEnv, pair("takeover-html-2"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect((await rowFor("takeover-html-2"))?.outcome_unknown).toBe(1);
+		// The token turns out to be unspent: once the mark lapses it renews.
+		await lapse("takeover-html-2");
+		const renewed = await renewUserToken(appEnv, pair("takeover-html-2"));
+		expect(renewed.accessToken).toBe("access-for-takeover-html-2");
 	});
 
 	it("retries recording the pair once when the first write fails", async () => {

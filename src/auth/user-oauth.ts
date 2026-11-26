@@ -91,6 +91,19 @@ export class ReauthorizationRequired extends Error {
 	}
 }
 
+/**
+ * Thrown when GitHub gave no usable OAuth answer: a 5xx or 429, a body that is
+ * not JSON (typically an HTML error page during an incident), or a 5xx JSON
+ * body without an OAuth `error`. Like a timeout, this says nothing about the
+ * refresh token, which GitHub did not get as far as spending.
+ */
+export class GitHubUnavailable extends Error {
+	constructor(detail: string) {
+		super(`GitHub's token endpoint is temporarily unavailable. (${detail})`);
+		this.name = "GitHubUnavailable";
+	}
+}
+
 async function tokenRequest(
 	env: AppEnv,
 	params: Record<string, string>,
@@ -107,16 +120,31 @@ async function tokenRequest(
 		body: new URLSearchParams(params).toString(),
 	});
 
-	const payload = (await response.json()) as any;
+	// Read as text first: during an incident GitHub answers with an HTML error
+	// page, and `response.json()` would throw a bare SyntaxError for it.
+	const text = await response.text();
+	let payload: any;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		throw new GitHubUnavailable(
+			`HTTP ${response.status}, ${response.headers.get("Content-Type") ?? "no content type"}`,
+		);
+	}
 
 	// GitHub reports OAuth failures as HTTP 200 with an `error` key, so the
-	// status alone tells you nothing.
+	// status alone tells you nothing. An OAuth error is a real answer whatever
+	// the status: a spent token or a misconfigured app is not worth retrying.
 	if (payload?.error) {
 		const detail = payload.error_description ?? payload.error;
 		if (payload.error === "bad_refresh_token" || payload.error === "bad_verification_code") {
 			throw new ReauthorizationRequired(String(detail));
 		}
 		throw new Error(`GitHub refused the token request: ${detail}`);
+	}
+
+	if (response.status === 429 || response.status >= 500) {
+		throw new GitHubUnavailable(`HTTP ${response.status}`);
 	}
 
 	if (!payload?.access_token) {

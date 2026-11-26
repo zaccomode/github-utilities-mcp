@@ -17,16 +17,18 @@
  * race for a few minutes, which also covers a client retrying a refresh whose
  * response it lost.
  *
- * A refresh that takes over an abandoned claim and is told the token is spent
- * cannot tell a dead grant from one whose earlier claimer spent the token and
- * saved the new pair into the grant without recording it here. It leaves the
- * row marked "outcome unknown" for a while, and until the mark lapses every
- * refresh of that token is asked to retry rather than told to reauthorise.
+ * A refresh that takes over an abandoned claim cannot tell a dead grant from
+ * one whose earlier claimer spent the token and saved the new pair into the
+ * grant without recording it here. If its own GitHub call fails in any way,
+ * whether GitHub says the token is spent, times out or answers with an error
+ * page, it leaves the row marked "outcome unknown" for a while, and until the
+ * mark lapses every refresh of that token is asked to retry rather than told
+ * to reauthorise.
  */
 
 import { sealString, sha256Hex, unsealString } from "./crypto";
 import { type AppEnv, required } from "../env";
-import { ReauthorizationRequired, type UserTokenSet, refreshUserToken } from "./user-oauth";
+import { GitHubUnavailable, type UserTokenSet, refreshUserToken } from "./user-oauth";
 
 /** How long a finished refresh's pair stays available to latecomers. */
 const HANDOFF_TTL_MS = 10 * 60 * 1000;
@@ -174,11 +176,13 @@ async function refreshAsClaimer(
 	} catch (error) {
 		// The claim this refresh took over may have been abandoned only in
 		// appearance: its holder can have spent the token and failed to record
-		// the pair, which is now in the grant. Calling the grant dead would
-		// revoke it, so mark the outcome unknown, which makes this refresh and
-		// every other one holding the token retry until the mark lapses. If the
-		// token really is dead, a refresh after that reports it.
-		if (tookOver && error instanceof ReauthorizationRequired) {
+		// the pair, which is now in the grant. Whatever went wrong here, this
+		// refresh learnt nothing that settles the token's fate, and releasing
+		// the row would let the next refresh claim it afresh and treat a spent
+		// token as a dead grant. So mark the outcome unknown, which makes this
+		// refresh and every other one holding the token retry until the mark
+		// lapses. If the token really is dead, a refresh after that reports it.
+		if (tookOver) {
 			await markOutcomeUnknown(env, id);
 			throw new RefreshInProgress();
 		}
@@ -250,11 +254,11 @@ async function markOutcomeUnknown(env: AppEnv, id: string): Promise<void> {
 
 /**
  * A failure that says nothing about the refresh token: the request to GitHub
- * timed out, was aborted, or never got an answer (`fetch` rejects with a
- * `TypeError` when the connection fails).
+ * timed out, was aborted, never got an answer (`fetch` rejects with a
+ * `TypeError` when the connection fails), or got no usable OAuth answer.
  */
 function isTransient(error: unknown): boolean {
-	if (error instanceof TypeError) {
+	if (error instanceof TypeError || error instanceof GitHubUnavailable) {
 		return true;
 	}
 	const name = (error as { name?: unknown } | null)?.name;

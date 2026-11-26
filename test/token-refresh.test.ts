@@ -119,4 +119,56 @@ describe("refreshing at the token endpoint", () => {
 		const body = (await response.json()) as { error: string };
 		expect(body.error).toBe("temporarily_unavailable");
 	});
+
+	it("answers a 502 HTML page from GitHub with a retryable 503", async () => {
+		const grant = await grantDueForRenewal("gh-refresh-502");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response("<html><body>502 Bad Gateway</body></html>", {
+					status: 502,
+					headers: { "Content-Type": "text/html" },
+				}),
+		);
+
+		const response = await post("/token", {
+			grant_type: "refresh_token",
+			refresh_token: grant.refreshToken,
+			client_id: grant.clientId,
+		});
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("Retry-After")).toBe("5");
+		const body = (await response.json()) as { error: string };
+		expect(body.error).toBe("temporarily_unavailable");
+	});
+
+	it("still fails, rather than asking for a retry, when the app is misconfigured", async () => {
+		const grant = await grantDueForRenewal("gh-refresh-bad-creds");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(
+					JSON.stringify({
+						error: "incorrect_client_credentials",
+						error_description:
+							"The client_id and/or client_secret passed are incorrect.",
+					}),
+					{ headers: { "Content-Type": "application/json" } },
+				),
+		);
+
+		// A hard failure, as before: the provider lets the error escape, and the
+		// runtime answers with a 500. It must not look like a retryable 503.
+		const outcome = await post("/token", {
+			grant_type: "refresh_token",
+			refresh_token: grant.refreshToken,
+			client_id: grant.clientId,
+		}).catch((error: unknown) => error);
+
+		if (outcome instanceof Response) {
+			expect(outcome.status).not.toBe(503);
+			expect(outcome.headers.get("Retry-After")).toBeNull();
+		} else {
+			expect(String((outcome as Error).message)).toContain("incorrect");
+		}
+	});
 });
