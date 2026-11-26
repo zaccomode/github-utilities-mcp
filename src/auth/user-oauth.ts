@@ -91,17 +91,63 @@ export class ReauthorizationRequired extends Error {
 	}
 }
 
+/** The wait used when GitHub is unavailable but sends no `Retry-After`. */
+export const DEFAULT_RETRY_AFTER_SECONDS = 10;
+
 /**
- * Thrown when GitHub gave no usable OAuth answer: a 5xx or 429, a body that is
- * not JSON (typically an HTML error page during an incident), or a 5xx JSON
- * body without an OAuth `error`. Like a timeout, this says nothing about the
- * refresh token, which GitHub did not get as far as spending.
+ * The longest wait honoured from GitHub's `Retry-After`. A longer one is cut
+ * to this, so a mistaken header cannot lock a grant out for hours.
+ */
+export const MAX_RETRY_AFTER_SECONDS = 300;
+
+/**
+ * Thrown when GitHub gave no usable OAuth answer and said, by its status, that
+ * the problem is on its side or temporary: a 408, 429 or 5xx, whether the body
+ * is an HTML error page or JSON without an OAuth `error`. Like a timeout, this
+ * says nothing about the refresh token, which GitHub did not get as far as
+ * spending.
  */
 export class GitHubUnavailable extends Error {
-	constructor(detail: string) {
+	/** How long GitHub asked us to wait, or a default when it did not say. */
+	readonly retryAfterSeconds: number;
+
+	constructor(detail: string, retryAfterSeconds = DEFAULT_RETRY_AFTER_SECONDS) {
 		super(`GitHub's token endpoint is temporarily unavailable. (${detail})`);
 		this.name = "GitHubUnavailable";
+		this.retryAfterSeconds = retryAfterSeconds;
 	}
+}
+
+/**
+ * Reads a `Retry-After` header, either delay-seconds or an HTTP date, into a
+ * whole number of seconds between 1 and `MAX_RETRY_AFTER_SECONDS`. Absent or
+ * unreadable headers give `DEFAULT_RETRY_AFTER_SECONDS`.
+ */
+export function parseRetryAfter(header: string | null, now = Date.now()): number {
+	const value = header?.trim();
+	if (!value) {
+		return DEFAULT_RETRY_AFTER_SECONDS;
+	}
+	let seconds: number;
+	if (/^\d+$/.test(value)) {
+		seconds = Number(value);
+	} else if (/^[+-]?[\d.]+$/.test(value)) {
+		// Negative or fractional: not valid delay-seconds, and Date.parse
+		// would happily read "-5" as a year.
+		return DEFAULT_RETRY_AFTER_SECONDS;
+	} else {
+		const at = Date.parse(value);
+		if (Number.isNaN(at)) {
+			return DEFAULT_RETRY_AFTER_SECONDS;
+		}
+		seconds = Math.ceil((at - now) / 1000);
+	}
+	return Math.min(MAX_RETRY_AFTER_SECONDS, Math.max(1, seconds));
+}
+
+/** Statuses that mean "not now" rather than "no". */
+function isTemporaryStatus(status: number): boolean {
+	return status === 408 || status === 429 || status >= 500;
 }
 
 async function tokenRequest(
@@ -127,9 +173,18 @@ async function tokenRequest(
 	try {
 		payload = JSON.parse(text);
 	} catch {
-		throw new GitHubUnavailable(
-			`HTTP ${response.status}, ${response.headers.get("Content-Type") ?? "no content type"}`,
-		);
+		const detail = `HTTP ${response.status}, ${response.headers.get("Content-Type") ?? "no content type"}`;
+		// Only a status that says "try later" makes an unreadable body a
+		// temporary problem. Anything else, such as a 403 page from abuse
+		// detection or a firewall, a 404, or HTML on a 200, will not fix
+		// itself, so it fails visibly instead of being retried forever.
+		if (isTemporaryStatus(response.status)) {
+			throw new GitHubUnavailable(
+				detail,
+				parseRetryAfter(response.headers.get("Retry-After")),
+			);
+		}
+		throw new Error(`GitHub's token endpoint gave an unreadable answer (${detail}).`);
 	}
 
 	// GitHub reports OAuth failures as HTTP 200 with an `error` key, so the
@@ -143,8 +198,11 @@ async function tokenRequest(
 		throw new Error(`GitHub refused the token request: ${detail}`);
 	}
 
-	if (response.status === 429 || response.status >= 500) {
-		throw new GitHubUnavailable(`HTTP ${response.status}`);
+	if (isTemporaryStatus(response.status)) {
+		throw new GitHubUnavailable(
+			`HTTP ${response.status}`,
+			parseRetryAfter(response.headers.get("Retry-After")),
+		);
 	}
 
 	if (!payload?.access_token) {

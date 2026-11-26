@@ -2,7 +2,13 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppEnv } from "../src/env";
 import { RefreshInProgress, renewUserToken } from "../src/auth/refresh";
-import { ReauthorizationRequired, type UserTokenSet } from "../src/auth/user-oauth";
+import {
+	DEFAULT_RETRY_AFTER_SECONDS,
+	MAX_RETRY_AFTER_SECONDS,
+	ReauthorizationRequired,
+	type UserTokenSet,
+	parseRetryAfter,
+} from "../src/auth/user-oauth";
 
 /**
  * Concurrent refreshes of one grant against a fake GitHub that, like the real
@@ -22,6 +28,11 @@ let failNextWith:
 	| "html502"
 	| "json503"
 	| "rateLimited"
+	| "rateLimitedRetryAfter"
+	| "html429"
+	| "html403"
+	| "html404"
+	| "html200"
 	| "badCredentials"
 	| undefined;
 
@@ -79,6 +90,22 @@ beforeEach(() => {
 				headers: { "Content-Type": "application/json" },
 			});
 		}
+		if (failNextWith === "rateLimitedRetryAfter") {
+			failNextWith = undefined;
+			return new Response(JSON.stringify({ message: "Too many requests" }), {
+				status: 429,
+				headers: { "Content-Type": "application/json", "Retry-After": "42" },
+			});
+		}
+		const htmlStatus = { html429: 429, html403: 403, html404: 404, html200: 200 } as const;
+		if (failNextWith && failNextWith in htmlStatus) {
+			const status = htmlStatus[failNextWith as keyof typeof htmlStatus];
+			failNextWith = undefined;
+			return new Response(`<html><body>${status}</body></html>`, {
+				status,
+				headers: { "Content-Type": "text/html" },
+			});
+		}
 		if (failNextWith === "badCredentials") {
 			failNextWith = undefined;
 			return new Response(
@@ -129,13 +156,19 @@ async function staleClaim(refreshToken: string, ageMs: number): Promise<void> {
 
 async function rowFor(refreshToken: string) {
 	return appEnv.DB.prepare(
-		`SELECT sealed_tokens, outcome_unknown FROM token_refreshes WHERE id = ?1`,
+		`SELECT sealed_tokens, outcome_unknown, cooldown, expires_at
+		 FROM token_refreshes WHERE id = ?1`,
 	)
 		.bind(await rowIdFor(refreshToken))
-		.first<{ sealed_tokens: string | null; outcome_unknown: number }>();
+		.first<{
+			sealed_tokens: string | null;
+			outcome_unknown: number;
+			cooldown: number;
+			expires_at: number;
+		}>();
 }
 
-/** Lets an "outcome unknown" mark on `refreshToken` lapse. */
+/** Lets an "outcome unknown" mark or a cooldown on `refreshToken` lapse. */
 async function lapse(refreshToken: string): Promise<void> {
 	await appEnv.DB.prepare(`UPDATE token_refreshes SET expires_at = ?2 WHERE id = ?1`)
 		.bind(await rowIdFor(refreshToken), Date.now() - 1)
@@ -310,35 +343,97 @@ describe("renewUserToken", () => {
 		expect(await rowFor("offline-1")).toBeNull();
 	});
 
-	it("asks the client to retry when GitHub answers with a 5xx HTML page", async () => {
-		unspent.add("html-1");
-		failNextWith = "html502";
-		await expect(renewUserToken(appEnv, pair("html-1"))).rejects.toBeInstanceOf(
-			RefreshInProgress,
-		);
-		expect(await rowFor("html-1")).toBeNull();
-		// GitHub never spent the token, so the retry renews it.
-		const renewed = await renewUserToken(appEnv, pair("html-1"));
-		expect(renewed.accessToken).toBe("access-for-html-1");
+	for (const failure of ["html502", "json503", "rateLimited", "html429"] as const) {
+		it(`cools down, rather than releasing the claim, when GitHub is unavailable (${failure})`, async () => {
+			const token = `cooldown-${failure}`;
+			unspent.add(token);
+			failNextWith = failure;
+			const error = await renewUserToken(appEnv, pair(token)).catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(RefreshInProgress);
+			// No Retry-After from GitHub, so the default applies.
+			expect((error as RefreshInProgress).retryAfterSeconds).toBe(
+				DEFAULT_RETRY_AFTER_SECONDS,
+			);
+			const row = await rowFor(token);
+			expect(row?.cooldown).toBe(1);
+			expect(row?.outcome_unknown).toBe(0);
+			// A retry inside the cooldown is asked to wait, without calling GitHub.
+			await expect(renewUserToken(appEnv, pair(token))).rejects.toBeInstanceOf(
+				RefreshInProgress,
+			);
+			expect(githubCalls).toEqual([token]);
+			// GitHub never spent the token, so once the cooldown is over it renews.
+			await lapse(token);
+			const renewed = await renewUserToken(appEnv, pair(token));
+			expect(renewed.accessToken).toBe(`access-for-${token}`);
+			expect(githubCalls).toEqual([token, token]);
+		});
+	}
+
+	it("honours GitHub's Retry-After on a 429 and passes it on", async () => {
+		unspent.add("retry-after-1");
+		failNextWith = "rateLimitedRetryAfter";
+		const before = Date.now();
+		const error = await renewUserToken(appEnv, pair("retry-after-1")).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(RefreshInProgress);
+		expect((error as RefreshInProgress).retryAfterSeconds).toBe(42);
+		const row = await rowFor("retry-after-1");
+		expect(row?.cooldown).toBe(1);
+		expect(row!.expires_at).toBeGreaterThanOrEqual(before + 42_000);
+		// A retry during the cooldown is told how much of it is left, and
+		// GitHub is not called again.
+		const retry = await renewUserToken(appEnv, pair("retry-after-1")).catch((e: unknown) => e);
+		expect(retry).toBeInstanceOf(RefreshInProgress);
+		expect((retry as RefreshInProgress).retryAfterSeconds).toBeGreaterThan(30);
+		expect((retry as RefreshInProgress).retryAfterSeconds).toBeLessThanOrEqual(42);
+		expect(githubCalls).toEqual(["retry-after-1"]);
 	});
 
-	it("asks the client to retry when GitHub answers a 5xx with no OAuth error", async () => {
-		unspent.add("json503-1");
-		failNextWith = "json503";
-		await expect(renewUserToken(appEnv, pair("json503-1"))).rejects.toBeInstanceOf(
-			RefreshInProgress,
+	it("makes one GitHub call between concurrent refreshes during a 429", async () => {
+		unspent.add("retry-after-2");
+		failNextWith = "rateLimitedRetryAfter";
+		const results = await Promise.allSettled(
+			Array.from({ length: 4 }, () => renewUserToken(appEnv, pair("retry-after-2"))),
 		);
-		expect(await rowFor("json503-1")).toBeNull();
+		for (const result of results) {
+			expect(result.status).toBe("rejected");
+			const reason = (result as PromiseRejectedResult).reason;
+			expect(reason).toBeInstanceOf(RefreshInProgress);
+			expect(reason.retryAfterSeconds).toBeGreaterThan(30);
+		}
+		expect(githubCalls).toEqual(["retry-after-2"]);
 	});
 
-	it("asks the client to retry when GitHub rate-limits the token request", async () => {
-		unspent.add("ratelimit-1");
-		failNextWith = "rateLimited";
-		await expect(renewUserToken(appEnv, pair("ratelimit-1"))).rejects.toBeInstanceOf(
+	it("does not take over a cooldown however old its claim is", async () => {
+		unspent.add("cooldown-old-1");
+		failNextWith = "rateLimitedRetryAfter";
+		await expect(renewUserToken(appEnv, pair("cooldown-old-1"))).rejects.toBeInstanceOf(
 			RefreshInProgress,
 		);
-		expect(await rowFor("ratelimit-1")).toBeNull();
+		// The claim is past the takeover age, but the cooldown is still live.
+		await appEnv.DB.prepare(`UPDATE token_refreshes SET claimed_at = ?2 WHERE id = ?1`)
+			.bind(await rowIdFor("cooldown-old-1"), Date.now() - 60_000)
+			.run();
+		await expect(renewUserToken(appEnv, pair("cooldown-old-1"))).rejects.toBeInstanceOf(
+			RefreshInProgress,
+		);
+		expect(githubCalls).toEqual(["cooldown-old-1"]);
 	});
+
+	for (const failure of ["html403", "html404", "html200"] as const) {
+		it(`fails hard on a non-JSON answer that is not temporary (${failure})`, async () => {
+			const token = `hard-${failure}`;
+			unspent.add(token);
+			failNextWith = failure;
+			const error = await renewUserToken(appEnv, pair(token)).catch((e: unknown) => e);
+			expect(error).toBeInstanceOf(Error);
+			expect(error).not.toBeInstanceOf(RefreshInProgress);
+			expect(error).not.toBeInstanceOf(ReauthorizationRequired);
+			expect(String((error as Error).message)).toContain("text/html");
+			// Released, not cooled down: nothing about it is temporary.
+			expect(await rowFor(token)).toBeNull();
+		});
+	}
 
 	it("still fails hard on a configuration error such as bad client credentials", async () => {
 		unspent.add("creds-1");
@@ -388,6 +483,17 @@ describe("renewUserToken", () => {
 			expect(githubCalls).toEqual([token]);
 		});
 	}
+
+	it("keeps a takeover's mark for at least GitHub's Retry-After", async () => {
+		await staleClaim("takeover-429", 31_000);
+		failNextWith = "rateLimitedRetryAfter";
+		const error = await renewUserToken(appEnv, pair("takeover-429")).catch((e: unknown) => e);
+		expect(error).toBeInstanceOf(RefreshInProgress);
+		expect((error as RefreshInProgress).retryAfterSeconds).toBe(42);
+		const row = await rowFor("takeover-429");
+		expect(row?.outcome_unknown).toBe(1);
+		expect(row?.cooldown).toBe(0);
+	});
 
 	it("keeps a takeover's row marked after a 5xx HTML page, then releases it to a fresh claim", async () => {
 		unspent.add("takeover-html-2");
@@ -449,5 +555,31 @@ describe("renewUserToken", () => {
 		const dump = JSON.stringify(rows.results);
 		expect(dump).not.toContain("store-1");
 		expect(dump).not.toContain(renewed.accessToken);
+	});
+});
+
+describe("parseRetryAfter", () => {
+	it("reads delay-seconds", () => {
+		expect(parseRetryAfter("42")).toBe(42);
+		expect(parseRetryAfter(" 7 ")).toBe(7);
+	});
+
+	it("reads an HTTP date", () => {
+		const now = Date.parse("2026-01-01T00:00:00Z");
+		expect(parseRetryAfter("Thu, 01 Jan 2026 00:01:00 GMT", now)).toBe(60);
+	});
+
+	it("falls back to the default when absent or unreadable", () => {
+		expect(parseRetryAfter(null)).toBe(DEFAULT_RETRY_AFTER_SECONDS);
+		expect(parseRetryAfter("")).toBe(DEFAULT_RETRY_AFTER_SECONDS);
+		expect(parseRetryAfter("soon")).toBe(DEFAULT_RETRY_AFTER_SECONDS);
+		expect(parseRetryAfter("-5")).toBe(DEFAULT_RETRY_AFTER_SECONDS);
+	});
+
+	it("keeps the wait between one second and the cap", () => {
+		expect(parseRetryAfter("0")).toBe(1);
+		const now = Date.parse("2026-01-01T00:00:00Z");
+		expect(parseRetryAfter("Wed, 31 Dec 2025 23:00:00 GMT", now)).toBe(1);
+		expect(parseRetryAfter("86400")).toBe(MAX_RETRY_AFTER_SECONDS);
 	});
 });

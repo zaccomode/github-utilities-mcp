@@ -24,11 +24,20 @@
  * page, it leaves the row marked "outcome unknown" for a while, and until the
  * mark lapses every refresh of that token is asked to retry rather than told
  * to reauthorise.
+ *
+ * A refresh that holds a fresh claim and finds GitHub unavailable (a 408, 429
+ * or 5xx) knows the token was not spent, but calling again at once would only
+ * add to the load. It keeps the row as a cooldown until GitHub's Retry-After
+ * has passed, and every refresh of that token in the meantime is asked to
+ * retry after the remaining wait, without calling GitHub.
  */
 
 import { sealString, sha256Hex, unsealString } from "./crypto";
 import { type AppEnv, required } from "../env";
 import { GitHubUnavailable, type UserTokenSet, refreshUserToken } from "./user-oauth";
+
+/** The wait suggested to a client when there is no better estimate. */
+const DEFAULT_RETRY_AFTER_SECONDS = 5;
 
 /** How long a finished refresh's pair stays available to latecomers. */
 const HANDOFF_TTL_MS = 10 * 60 * 1000;
@@ -44,7 +53,7 @@ const CLAIM_TIMEOUT_MS = 30 * 1000;
 const GITHUB_TIMEOUT_MS = 15 * 1000;
 
 /**
- * How long a token whose outcome is unknown (see `markOutcomeUnknown`) keeps
+ * How long a token whose outcome is unknown (see `hold`) keeps
  * every refresh of it waiting. Long enough to outlast KV serving a grant's old
  * props in another colo (up to about a minute) plus a client's retries, short
  * enough that a token that really is dead is reported soon after.
@@ -71,9 +80,13 @@ export interface RenewOptions {
 }
 
 export class RefreshInProgress extends Error {
-	constructor() {
+	/** How long the client should wait before retrying; sent as Retry-After. */
+	readonly retryAfterSeconds: number;
+
+	constructor(retryAfterSeconds = DEFAULT_RETRY_AFTER_SECONDS) {
 		super("Another refresh of this connection is still in progress. Try again shortly.");
 		this.name = "RefreshInProgress";
+		this.retryAfterSeconds = retryAfterSeconds;
 	}
 }
 
@@ -116,7 +129,7 @@ export async function renewUserToken(
 		let released = false;
 		while (!released) {
 			const row = await env.DB.prepare(
-				`SELECT sealed_tokens, claimed_at, expires_at, outcome_unknown
+				`SELECT sealed_tokens, claimed_at, expires_at, outcome_unknown, cooldown
 				 FROM token_refreshes WHERE id = ?1`,
 			)
 				.bind(id)
@@ -125,6 +138,7 @@ export async function renewUserToken(
 					claimed_at: number;
 					expires_at: number;
 					outcome_unknown: number;
+					cooldown: number;
 				}>();
 
 			if (!row) {
@@ -136,6 +150,16 @@ export async function renewUserToken(
 					throw new RefreshInProgress();
 				}
 				// The mark has lapsed: claim() replaces it with a fresh claim.
+				released = true;
+				break;
+			}
+			if (row.cooldown) {
+				const remainingMs = row.expires_at - Date.now();
+				if (remainingMs > 0) {
+					// GitHub asked for a pause; wait it out without calling.
+					throw new RefreshInProgress(Math.ceil(remainingMs / 1000));
+				}
+				// The cooldown is over: claim() replaces it with a fresh claim.
 				released = true;
 				break;
 			}
@@ -182,9 +206,25 @@ async function refreshAsClaimer(
 		// token as a dead grant. So mark the outcome unknown, which makes this
 		// refresh and every other one holding the token retry until the mark
 		// lapses. If the token really is dead, a refresh after that reports it.
+		const unavailable = error instanceof GitHubUnavailable ? error : undefined;
 		if (tookOver) {
-			await markOutcomeUnknown(env, id);
-			throw new RefreshInProgress();
+			// The mark lasts at least as long as GitHub asked us to wait, so
+			// nobody calls it again sooner by claiming the row afresh.
+			await hold(
+				env,
+				id,
+				"outcome_unknown",
+				Math.max(OUTCOME_UNKNOWN_TTL_MS, (unavailable?.retryAfterSeconds ?? 0) * 1000),
+			);
+			throw new RefreshInProgress(unavailable?.retryAfterSeconds);
+		}
+		// GitHub is up but not answering, and this refresh holds a fresh claim,
+		// so the token is certainly unspent. Rather than releasing the claim,
+		// which would let every retry call GitHub again at once, keep the row
+		// as a cooldown until GitHub's Retry-After has passed.
+		if (unavailable) {
+			await hold(env, id, "cooldown", unavailable.retryAfterSeconds * 1000);
+			throw new RefreshInProgress(unavailable.retryAfterSeconds);
 		}
 		// Release the claim so anyone waiting stops waiting.
 		await env.DB.prepare(`DELETE FROM token_refreshes WHERE id = ?1 AND sealed_tokens IS NULL`)
@@ -192,7 +232,9 @@ async function refreshAsClaimer(
 			.run()
 			.catch(() => undefined);
 		// GitHub being slow or unreachable is temporary: the refresh token was
-		// not spent, so the client should retry rather than see a 500.
+		// not spent, so the client should retry rather than see a 500. There
+		// is no answer to take a Retry-After from, so the next refresh may try
+		// straight away.
 		if (isTransient(error)) {
 			throw new RefreshInProgress();
 		}
@@ -231,20 +273,28 @@ async function refreshAsClaimer(
 }
 
 /**
- * Keeps the claim's row, flagged, until `OUTCOME_UNKNOWN_TTL_MS` from now. If
- * the write fails the row is released instead, which is no worse than before
- * the flag existed.
+ * Keeps the claim's row, flagged, for `ttlMs` from now: `outcome_unknown` when
+ * the token may have been spent by an earlier claimer (see the file comment),
+ * `cooldown` when it certainly was not but GitHub asked for a pause. While
+ * either flag is live every refresh of the token is asked to retry. If the
+ * write fails the row is released instead, which is no worse than before the
+ * flags existed.
  */
-async function markOutcomeUnknown(env: AppEnv, id: string): Promise<void> {
+async function hold(
+	env: AppEnv,
+	id: string,
+	flag: "outcome_unknown" | "cooldown",
+	ttlMs: number,
+): Promise<void> {
 	try {
 		await env.DB.prepare(
-			`UPDATE token_refreshes SET outcome_unknown = 1, expires_at = ?2
+			`UPDATE token_refreshes SET ${flag} = 1, expires_at = ?2
 			 WHERE id = ?1 AND sealed_tokens IS NULL`,
 		)
-			.bind(id, Date.now() + OUTCOME_UNKNOWN_TTL_MS)
+			.bind(id, Date.now() + ttlMs)
 			.run();
 	} catch (error) {
-		console.error("Could not mark a refresh's outcome unknown:", error);
+		console.error(`Could not mark a refresh's row (${flag}):`, error);
 		await env.DB.prepare(`DELETE FROM token_refreshes WHERE id = ?1 AND sealed_tokens IS NULL`)
 			.bind(id)
 			.run()
@@ -266,8 +316,8 @@ function isTransient(error: unknown): boolean {
 }
 
 /**
- * Takes the row for `id`: inserts it, replaces an "outcome unknown" mark that
- * has lapsed, or takes over a claim whose holder has gone quiet without leaving
+ * Takes the row for `id`: inserts it, replaces an "outcome unknown" mark or a
+ * cooldown that has lapsed, or takes over a claim whose holder has gone quiet without leaving
  * a pair. Truthy when this refresh should call GitHub, and `"takeover"` when
  * someone else may have spent the token first.
  */
@@ -284,10 +334,12 @@ async function claim(env: AppEnv, id: string): Promise<"fresh" | "takeover" | fa
 		return "fresh";
 	}
 	// A lapsed mark has given any pair it was protecting time to reach the
-	// grant, so a spent token now really does mean a dead grant.
+	// grant, so a spent token now really does mean a dead grant. A lapsed
+	// cooldown protected nothing but GitHub, and is simply over.
 	const replaced = await env.DB.prepare(
-		`UPDATE token_refreshes SET outcome_unknown = 0, claimed_at = ?2, expires_at = ?3
-		 WHERE id = ?1 AND outcome_unknown = 1 AND expires_at <= ?2`,
+		`UPDATE token_refreshes
+		 SET outcome_unknown = 0, cooldown = 0, claimed_at = ?2, expires_at = ?3
+		 WHERE id = ?1 AND (outcome_unknown = 1 OR cooldown = 1) AND expires_at <= ?2`,
 	)
 		.bind(id, now, now + HANDOFF_TTL_MS)
 		.run();
@@ -296,7 +348,8 @@ async function claim(env: AppEnv, id: string): Promise<"fresh" | "takeover" | fa
 	}
 	const takenOver = await env.DB.prepare(
 		`UPDATE token_refreshes SET claimed_at = ?2, expires_at = ?3
-		 WHERE id = ?1 AND sealed_tokens IS NULL AND outcome_unknown = 0 AND claimed_at <= ?4`,
+		 WHERE id = ?1 AND sealed_tokens IS NULL AND outcome_unknown = 0 AND cooldown = 0
+		   AND claimed_at <= ?4`,
 	)
 		.bind(id, now, now + HANDOFF_TTL_MS, now - CLAIM_TIMEOUT_MS)
 		.run();
