@@ -137,9 +137,54 @@ describe("refreshing at the token endpoint", () => {
 		});
 
 		expect(response.status).toBe(503);
-		expect(response.headers.get("Retry-After")).toBe("5");
+		// GitHub sent no Retry-After, so the default cooldown is advertised.
+		expect(response.headers.get("Retry-After")).toBe("10");
 		const body = (await response.json()) as { error: string };
 		expect(body.error).toBe("temporarily_unavailable");
+	});
+
+	it("passes GitHub's Retry-After on a 429 through to the client", async () => {
+		const grant = await grantDueForRenewal("gh-refresh-429");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ message: "Too many requests" }), {
+					status: 429,
+					headers: { "Content-Type": "application/json", "Retry-After": "42" },
+				}),
+		);
+
+		const response = await post("/token", {
+			grant_type: "refresh_token",
+			refresh_token: grant.refreshToken,
+			client_id: grant.clientId,
+		});
+
+		expect(response.status).toBe(503);
+		expect(response.headers.get("Retry-After")).toBe("42");
+	});
+
+	it("fails, rather than asking for a retry, on a non-JSON 403 from GitHub", async () => {
+		const grant = await grantDueForRenewal("gh-refresh-403");
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response("<html><body>Access denied</body></html>", {
+					status: 403,
+					headers: { "Content-Type": "text/html" },
+				}),
+		);
+
+		const outcome = await post("/token", {
+			grant_type: "refresh_token",
+			refresh_token: grant.refreshToken,
+			client_id: grant.clientId,
+		}).catch((error: unknown) => error);
+
+		if (outcome instanceof Response) {
+			expect(outcome.status).not.toBe(503);
+			expect(outcome.headers.get("Retry-After")).toBeNull();
+		} else {
+			expect(String((outcome as Error).message)).toContain("HTTP 403");
+		}
 	});
 
 	it("still fails, rather than asking for a retry, when the app is misconfigured", async () => {

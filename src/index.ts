@@ -170,7 +170,7 @@ function getProvider(env: AppEnv): OAuthProvider<AppEnv> {
 					throw new OAuthError("temporarily_unavailable", {
 						description: error.message,
 						statusCode: 503,
-						headers: { "Retry-After": "5" },
+						headers: { "Retry-After": String(error.retryAfterSeconds) },
 					});
 				}
 				throw error;
